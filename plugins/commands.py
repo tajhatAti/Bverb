@@ -2,6 +2,7 @@
 import re
 
 import engine
+import linkguard
 from core import events, hub, parse_duration
 
 
@@ -68,6 +69,103 @@ async def _handle(event):
             await event.reply(body)
         return
 
+    # ---------------- notun niyontron command (rule lagbe na) ----------------
+    if name in ("linktest", "link", "test"):
+        res = linkguard.test(argstr)
+        if res["has_link"]:
+            body = "🔍 Link dhora poreche: " + str(res["count"]) + "\n" + "\n".join(
+                f"• {x['link']}  ({x['why']})" for x in res["links"][:8])
+        else:
+            body = "✅ Ei text e kono link paoa jayni"
+        await _say(event, body)
+        return
+    if name in ("shield", "linkban"):
+        gc = hub.group_cfg(chat_id)
+        lg = gc.get("link_guard") or {}
+        arg = argstr.strip().lower()
+        if arg in ("on", "chalu", "1"):
+            hub.cfg["groups"].setdefault(str(chat_id), {})
+            g = hub.cfg["groups"][str(chat_id)]
+            g.setdefault("link_guard", {})["on"] = True
+            hub.save()
+            await _say(event, "🛡 Link Shield CHALU - ekhon theke jekono link sathe sathe delete hobe")
+        elif arg in ("off", "bondho", "0"):
+            hub.cfg["groups"].setdefault(str(chat_id), {})
+            g = hub.cfg["groups"][str(chat_id)]
+            g.setdefault("link_guard", {})["on"] = False
+            hub.save()
+            await _say(event, "🛡 Link Shield bondho kora hobe ei group e")
+        else:
+            st = hub.cfg["settings"]
+            on = bool(lg.get("on", True) and st.get("link_guard", True))
+            await _say(event, ("🛡 Link Shield: " + ("CHALU ✅" if on else "BONDHO ❌") +
+                               "\nMode: " + str(lg.get("mode", "strike")) +
+                               "\nAllow: " + (", ".join(lg.get("allow") or []) or "kichu na") +
+                               "\nBodlate: " + prefix + "shield on / " + prefix + "shield off"))
+        return
+    if name in ("wl", "allow"):
+        if not argstr.strip():
+            await _say(event, "Ki likhbe: " + prefix + "wl youtube.com")
+            return
+        hub.cfg["groups"].setdefault(str(chat_id), {})
+        g = hub.cfg["groups"][str(chat_id)]
+        lst = g.setdefault("link_guard", {}).setdefault("allow", [])
+        for d in argstr.split():
+            d = d.strip().lower()
+            if d and d not in lst:
+                lst.append(d)
+        hub.save()
+        await _say(event, "✅ Allow list: " + (", ".join(lst) or "khali"))
+        return
+    if name in ("unwl", "unallow"):
+        hub.cfg["groups"].setdefault(str(chat_id), {})
+        g = hub.cfg["groups"][str(chat_id)]
+        lst = g.setdefault("link_guard", {}).setdefault("allow", [])
+        for d in argstr.split():
+            d = d.strip().lower()
+            if d in lst:
+                lst.remove(d)
+        hub.save()
+        await _say(event, "Allow list: " + (", ".join(lst) or "khali"))
+        return
+    if name in ("bl", "blacklist"):
+        reply = await event.get_reply_message() if event.is_reply else None
+        tok, _d, _r, _n = parse_args(argstr, reply is not None)
+        uid = reply.sender_id if reply else (await _resolve_user(tok) if tok else None)
+        if not uid:
+            if hub.blacklist:
+                rows = list(hub.blacklist.items())[:20]
+                await _say(event, "🚫 Blacklist:\n" + "\n".join(f"• {v.get('name') or k} ({k})" for k, v in rows))
+            else:
+                await _say(event, "Blacklist khali. Reply diye likho: " + prefix + "bl")
+            return
+        nm = await hub.user_name(uid)
+        hub.blacklist_add(uid, nm, "manually")
+        await _say(event, f"🚫 {nm} ke blacklist kora holo - er sob message delete hobe")
+        return
+    if name in ("unbl", "unblacklist"):
+        reply = await event.get_reply_message() if event.is_reply else None
+        tok, _d, _r, _n = parse_args(argstr, reply is not None)
+        uid = reply.sender_id if reply else (await _resolve_user(tok) if tok else None)
+        if not uid:
+            await _say(event, "Reply diye likho ba id dao: " + prefix + "unbl 12345")
+            return
+        hub.blacklist_del(uid)
+        await _say(event, "✅ Blacklist theke tule neoa holo")
+        return
+    if name in ("id", "ids"):
+        reply = await event.get_reply_message() if event.is_reply else None
+        lines = [f"👤 Tomar ID: {by}", f"💬 Ei chat ID: {chat_id}"]
+        if reply:
+            lines.append(f"🎯 Reply kora user ID: {reply.sender_id}")
+        await _say(event, "\n".join(lines))
+        return
+    if name in ("stats", "stat"):
+        st = hub.stats_public()["today"]
+        await _say(event, "📊 Ajker hisheb:\n" +
+                   "\n".join(f"• {k}: {v}" for k, v in st.items()) if st else "Aj ekhono kichu hoyni")
+        return
+
     if not engine.find_rules("command", name, chat_id):
         return
 
@@ -83,6 +181,28 @@ async def _handle(event):
             await event.delete()
         except Exception:
             pass
+
+
+async def _say(event, text):
+    """Command er uttor (pathanor por nijei muchhe jay jodi setting thake)"""
+    try:
+        if event.out:
+            await event.edit(text)
+            return
+        m = await event.reply(text)
+        secs = int(hub.cfg["settings"].get("reply_delete_s", 0) or 0)
+        if secs > 0:
+            import asyncio
+
+            async def _later():
+                await asyncio.sleep(secs)
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_later())
+    except Exception as e:
+        hub.log(kind="error", msg=f"command reply: {type(e).__name__}: {e}")
 
 
 _last_rules = {}

@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 
 import actions
 import engine
+import linkguard
 from core import LOCK_NAMES, events, hub
 
 KIND_BN = {
@@ -99,10 +100,14 @@ def _word_hit(words, text):
 
 
 def _link_hit(f, allow):
-    t = f["text"]
-    low = t.lower()
-    has = (bool(_URL_RE.search(t)) or bool(_DOMAIN_RE.search(t))
-           or any(n in ("MessageEntityUrl", "MessageEntityTextUrl") for n in f["ents"]))
+    """Link ache kina - asol detector linkguard.py te, ekhane shudhu fallback"""
+    for link, _why in linkguard.text_links(f["text"]):
+        if not linkguard.is_allowed(link, allow):
+            return True
+    if any(n in ("MessageEntityUrl", "MessageEntityTextUrl") for n in f["ents"]):
+        return True
+    low = f["text"].lower()
+    has = bool(_URL_RE.search(f["text"])) or bool(_DOMAIN_RE.search(f["text"]))
     if has and any(a.strip().lower() in low for a in allow if a.strip()):
         return False
     return has
@@ -123,7 +128,7 @@ def detect(am, f, now, chat, user, newbie=False):
                 lk[n] = {"on": True, "action": "delete", "mute_min": 0}
     t = f["text"]
     checks = [
-        ("links", lambda: _link_hit(f, am["links_allow"])),
+        ("links", lambda: (not linkguard.enabled(chat)) and _link_hit(f, am["links_allow"])),
         ("mention", lambda: bool(_MENTION_RE.search(t))),
         ("hashtag", lambda: bool(_HASHTAG_RE.search(t))),
         ("email", lambda: bool(_EMAIL_RE.search(t))),

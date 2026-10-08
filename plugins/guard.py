@@ -45,9 +45,12 @@ async def _handle(event):
     if not gc["enabled"]:
         return
     clean = gc["clean"]
+    gset = hub.cfg["settings"]
+    cj = clean["join"] or gset.get("delete_join_left")
+    cl = clean["leave"] or gset.get("delete_join_left")
     joined = bool(event.user_joined or event.user_added)
     if joined:
-        if clean["join"]:
+        if cj:
             await _del_service(event)
         users = (await event.get_users()) or []
         adder = getattr(event, "added_by", None)
@@ -58,7 +61,7 @@ async def _handle(event):
             await _on_new_user(event, gc, u, adder_id)
         await _antiraid(chat_id, gc, len(users))
     elif event.user_left or event.user_kicked:
-        if clean["leave"]:
+        if cl:
             await _del_service(event)
     elif getattr(event, "new_pin", False):
         if clean["pin"]:

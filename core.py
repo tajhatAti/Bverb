@@ -69,6 +69,9 @@ CAPTCHA_FILE = os.path.join(DATA, "captcha.json")
 STRIKE_FILE = os.path.join(DATA, "strikes.json")
 JOINED_FILE = os.path.join(DATA, "joined.json")
 LOCKS_FILE = os.path.join(DATA, "locks.json")
+BLACKLIST_FILE = os.path.join(DATA, "blacklist.json")
+STATS_FILE = os.path.join(DATA, "stats.json")
+TEMPLATES_FILE = os.path.join(DATA, "templates.json")
 
 # Telegram reaction hishebe je emoji gulo allowed (standard list)
 ALLOWED_REACTIONS = (
@@ -97,6 +100,18 @@ DEFAULT_SETTINGS = {
     "bot_token": "",
     "cas_check": False,        # notun member ke CAS (Combot Anti-Spam) list e dekhe, spammer hole ban
     "log_chat": "",            # sob action er log ei group/channel e pathabe (id ba @username)
+    # ---------------- LINK SHIELD (notun) ----------------
+    "link_guard": True,             # MASTER SWITCH: jekono group e link dile sathe sathe delete
+    "link_all_admin_groups": True,  # je je group e ami admin sei sob group e apna apni chalu
+    "link_notice": True,            # group e chhoto warning pathabe (nijei muchhe jabe)
+    "link_notice_s": 12,            # oi warning koto sec pore muchbe
+    "link_bot_fallback": True,      # main account fail korle bot diye delete korbe
+    "auto_blacklist": True,         # bar bar link dile auto blacklist (tar sob message delete)
+    "auto_blacklist_after": 3,      # koybar link dile blacklist hobe
+    "link_block_edit": True,        # message edit kore link bosalo-o dhora porbe
+    "link_block_buttons": True,     # inline URL button wala message o delete
+    "delete_join_left": False,      # join/leave er service message sob group e muchbe
+    "reply_delete_s": 0,            # command er uttor koto sec pore muchbe (0 = na)
 }
 
 
@@ -149,10 +164,29 @@ LOCK_NAMES = ["links", "mention", "hashtag", "email", "phone", "long", "emoji", 
               "forward", "photo", "video", "sticker", "gif", "voice", "video_note", "audio", "document",
               "poll", "contact", "location", "game"]
 
+DEFAULT_LINK_GUARD = {
+    "on": True,                    # ei group e link shield chalu
+    "exempt_admins": True,         # group er admin ra link dite parbe
+    "mode": "strike",              # delete | warn | strike | mute | ban | kick
+    "mute_min": 120,               # mute/restrict hole koto minit
+    "ban_after": 3,                # koybar link dile direct ban (0 = na)
+    "steps": [{"action": "warn", "mute_min": 0},
+              {"action": "mute", "mute_min": 120},
+              {"action": "ban", "mute_min": 0}],
+    "notice": "🚫 {name}, ei group e link pathano nishiddho! Link sathe sathe delete hoye giyeche. ({n}/{max})",
+    "notice_s": 12,                # notice koto sec pore muchbe
+    "allow": [],                   # ei domain gulor link thakle delete hobe na (ek line e ekta)
+    "block_buttons": True,         # inline URL button wala message
+    "block_edits": True,           # edit kore link bosaleo dhora porbe
+    "block_forward": True,         # forward kora message e link thakleo delete
+    "block_names": True,           # username/name er moddhe link (jemon "join t.me/x")
+}
+
 DEFAULT_GROUP = {
     "enabled": True,
     "rules_text": "",
     "filters": [],     # [{"key": "price", "reply": "..."}]  keyword likhle auto reply
+    "link_guard": dict(DEFAULT_LINK_GUARD),
     "automod": {
         "enabled": False,
         # prottek lock: action = delete (shudhu muche) | strike (dhap dhap shasti) | mute | ban
@@ -265,6 +299,10 @@ class Hub:
         self.strikes = jload(STRIKE_FILE, {})
         self.joined = jload(JOINED_FILE, {})
         self.locks = jload(LOCKS_FILE, {})     # chat -> {"until": ts, "prev": {...}, "by": "raid|night|manual"}
+        self.blacklist = jload(BLACKLIST_FILE, {})   # uid(str) -> {"name":..., "reason":..., "t":..., "count":...}
+        self.stats = self._load_stats()
+        self.right_cache = {}                  # (chat, right) -> (ts, bool)
+        self._gcache = {}                      # group config cache
         self.raid_joins = {}
         self.night_state = {}
         self.action_times = deque()
@@ -285,9 +323,17 @@ class Hub:
 
     def save(self):
         jsave(CONFIG_FILE, self.cfg)
+        self._gcache = {}
 
     def group_cfg(self, chat_id):
-        return deep_merge(DEFAULT_GROUP, self.cfg["groups"].get(str(chat_id)))
+        key = str(chat_id)
+        c = self._gcache.get(key)
+        if c is None:
+            c = deep_merge(DEFAULT_GROUP, self.cfg["groups"].get(key))
+            if len(self._gcache) > 400:
+                self._gcache.clear()
+            self._gcache[key] = c
+        return c
 
     # ---------- log ----------
     def log(self, **kw):
@@ -375,6 +421,158 @@ class Hub:
 
     def save_locks(self):
         jsave(LOCKS_FILE, self.locks)
+
+    # ---------- blacklist ----------
+    def blacklisted(self, uid):
+        return str(uid) in self.blacklist
+
+    def blacklist_add(self, uid, name="", reason=""):
+        k = str(uid)
+        rec = self.blacklist.get(k) or {}
+        rec.update({"name": name or rec.get("name", ""), "reason": reason or rec.get("reason", ""),
+                    "t": time.time(), "count": int(rec.get("count", 0)) + 1})
+        self.blacklist[k] = rec
+        try:
+            jsave(BLACKLIST_FILE, self.blacklist)
+        except Exception:
+            pass
+        return rec
+
+    def blacklist_del(self, uid):
+        self.blacklist.pop(str(uid), None)
+        try:
+            jsave(BLACKLIST_FILE, self.blacklist)
+        except Exception:
+            pass
+
+    def save_blacklist(self):
+        try:
+            jsave(BLACKLIST_FILE, self.blacklist)
+        except Exception:
+            pass
+
+    # ---------- stats ----------
+    def _load_stats(self):
+        st = jload(STATS_FILE, {}) or {}
+        st.setdefault("day", "")
+        st.setdefault("today", {})
+        st.setdefault("history", {})
+        st.setdefault("offenders", {})
+        st.setdefault("groups", {})
+        st.setdefault("total", {})
+        self._roll_stats(st)
+        return st
+
+    @staticmethod
+    def _today():
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _roll_stats(self, st=None):
+        st = st if st is not None else self.stats
+        if st.get("day") != self._today():
+            old = st.get("day") or ""
+            if old and st.get("today"):
+                st.setdefault("history", {})[old] = st["today"]
+            hist = st.get("history") or {}
+            if len(hist) > 30:
+                for k in sorted(hist)[:-30]:
+                    hist.pop(k, None)
+            st["history"] = hist
+            st["today"] = {}
+            st["day"] = self._today()
+        st.setdefault("today", {})
+        return st
+
+    def bump(self, chat=None, chat_title="", user=None, user_name="", **counters):
+        """Stat gonoi (link delete, warn, mute, ban ...)."""
+        try:
+            st = self._roll_stats()
+            for k, v in counters.items():
+                if not v:
+                    continue
+                st["today"][k] = int(st["today"].get(k, 0)) + int(v)
+                st["total"][k] = int(st["total"].get(k, 0)) + int(v)
+            if user:
+                off = st.setdefault("offenders", {})
+                o = off.get(str(user)) or {"n": 0, "name": "", "last": 0, "chat": chat}
+                o["n"] = int(o.get("n", 0)) + 1
+                o["name"] = user_name or o.get("name") or str(user)
+                o["last"] = time.time()
+                o["chat"] = chat or o.get("chat")
+                off[str(user)] = o
+                if len(off) > 1500:
+                    for k in sorted(off, key=lambda x: off[x].get("last", 0))[:500]:
+                        off.pop(k, None)
+            if chat:
+                g = st.setdefault("groups", {})
+                r = g.get(str(chat)) or {"n": 0, "title": ""}
+                r["n"] = int(r.get("n", 0)) + 1
+                if chat_title:
+                    r["title"] = chat_title
+                g[str(chat)] = r
+            jsave(STATS_FILE, st)
+        except Exception:
+            pass
+
+    def offender_count(self, uid):
+        st = self._roll_stats()
+        return int(((st.get("offenders") or {}).get(str(uid)) or {}).get("n", 0))
+
+    def stats_public(self):
+        st = self._roll_stats()
+        hist = []
+        for d in sorted(list((st.get("history") or {}).keys()) + [st["day"]])[-7:]:
+            row = (st.get("history") or {}).get(d) or (st["today"] if d == st["day"] else {})
+            hist.append({"day": d, "links": int(row.get("links", 0)), "actions": int(row.get("actions", 0))})
+        offs = sorted(({"id": int(k), **v} for k, v in (st.get("offenders") or {}).items()),
+                      key=lambda x: -int(x.get("n", 0)))[:15]
+        grps = sorted(({"id": int(k), **v} for k, v in (st.get("groups") or {}).items()),
+                      key=lambda x: -int(x.get("n", 0)))[:10]
+        return {"today": st["today"], "total": st.get("total", {}), "history": hist,
+                "offenders": offs, "groups": grps, "day": st["day"]}
+
+    # ---------- message delete (retry + bot fallback) ----------
+    async def delete_msgs(self, chat_id, ids, retries=1):
+        ids = [i for i in (ids or []) if i]
+        if not self.client or not ids:
+            return False
+        try:
+            ent = await self.entity(chat_id)
+        except Exception:
+            ent = chat_id
+        for attempt in range(retries + 1):
+            try:
+                await self.client.delete_messages(ent, ids, revoke=True)
+                return True
+            except FLOOD as e:
+                await asyncio.sleep(min(flood_secs(e), 60) + 1)
+            except Exception:
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(0.8)
+        if self.cfg["settings"].get("link_bot_fallback", True) and self.bot:
+            try:
+                await self.bot.delete_messages(ent, ids)
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def can_delete(self, chat_id, force=False):
+        """Ei group e message delete korar adhikar ache kina (10 min cache)"""
+        key = (chat_id, "delete_messages")
+        now = time.time()
+        c = self.right_cache.get(key)
+        if c and not force and now - c[0] < 600:
+            return c[1]
+        try:
+            ent = await self.entity(chat_id)
+            val = await self.has_right(ent, "delete_messages")
+        except Exception:
+            val = None
+        val = bool(val)
+        self.right_cache[key] = (now, val)
+        return val
 
     def save_done_react(self):
         if len(self.done_react) > 5000:
